@@ -1,66 +1,80 @@
 #!/usr/bin/env bash
-# Graft the GL-MT5000 device support (OpenWrt PR #24237) onto official
-# openwrt-25.12, then convert the RTL8366UB (RTL8371C) switch from GL's
-# swconfig driver to a DSA driver ported to the kernel 6.12 API.
+# Graft the GL-MT5000 device support and in-tree kernel 6.18 RTL8366UB DSA +
+# MediaTek PPE offload series (OpenWrt PR #24237) onto official OpenWrt main.
 # Run with CWD = OpenWrt source root.
-set -eu
+set -euo pipefail
 
-WORKSPACE="${GITHUB_WORKSPACE:-$(cd "$(dirname "$0")/.." && pwd)}"
-RTLPKG=package/kernel/rtl8366ub
+KVER=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile)
+test -n "$KVER" || { echo ">> ERROR: failed to detect KERNEL_PATCHVER"; exit 1; }
+
 BOARDD=target/linux/mediatek/filogic/base-files/etc/board.d/02_network
+PLATSH=target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh
 FILOGIC_MK=target/linux/mediatek/image/filogic.mk
-KCFG=target/linux/mediatek/filogic/config-6.12
+KCFG="target/linux/mediatek/filogic/config-${KVER}"
+DTS=target/linux/mediatek/dts/mt7987a-glinet-gl-mt5000.dts
 
-# --- 1. Graft the single GL device-support commit (PR #24237 head) ---------
-echo ">> Grafting GL-MT5000 device support (PR #24237) onto openwrt-25.12"
-git config user.email build@local
-git config user.name mt5000-build
-git remote add glinet "${GL_DEVICE_COMMIT:-https://github.com/GLiNet-Tech/openwrt.git}" 2>/dev/null || true
-# depth>=2 so cherry-pick has the commit's PARENT as a merge base; with depth 1
-# git lacks the base and treats the whole tree as add/add conflicts.
-git fetch --depth 3 glinet mt5000
-git cherry-pick -n FETCH_HEAD || { echo ">> ERROR: graft cherry-pick failed (openwrt-25.12 drift?)"; git cherry-pick --abort 2>/dev/null || true; exit 1; }
-test -f target/linux/mediatek/dts/mt7987a-gl-mt5000.dts || { echo ">> ERROR: DTS missing after graft"; exit 1; }
-grep -q "glinet_gl-mt5000" "$FILOGIC_MK" || { echo ">> ERROR: device recipe missing after graft"; exit 1; }
-echo ">> graft OK"
+# --- 1. Graft PR #24237 onto official OpenWrt main (if not yet merged) -----
+if grep -q "glinet_gl-mt5000" "$FILOGIC_MK"; then
+	echo ">> GL-MT5000 already present in upstream OpenWrt main (kernel ${KVER}); skipping graft"
+else
+	echo ">> Grafting GL-MT5000 + RTL8366UB DSA/PPE series (PR #24237) onto OpenWrt main (kernel ${KVER})"
+	git config user.email build@local
+	git config user.name mt5000-build
+	git remote add glinet "${GL_DEVICE_COMMIT:-https://github.com/GLiNet-Tech/openwrt.git}" 2>/dev/null || true
+	git fetch --filter=blob:none glinet mt5000
 
-# --- 2. swconfig -> DSA ----------------------------------------------------
-echo ">> Converting RTL8366UB swconfig driver -> DSA (kernel 6.12 API)"
+	# If invoked on a shallow clone, fetch enough history so merge-base succeeds.
+	if ! BASE=$(git merge-base HEAD glinet/mt5000 2>/dev/null); then
+		echo ">> Shallow clone detected; unshallowing commit graph for merge-base"
+		git fetch --filter=blob:none --unshallow origin
+		BASE=$(git merge-base HEAD glinet/mt5000)
+	fi
 
-# Ported DSA driver + build the DSA object instead of the swconfig one
-cp "$WORKSPACE/files/dsa/rtl8366ub_dsa.c" "$RTLPKG/src/rtl8366ub_dsa.c"
-sed -i 's#^rtl8366ub-y += rtl8366ub_mdio.o#rtl8366ub-y += rtl8366ub_dsa.o#' "$RTLPKG/src/Makefile"
-sed -i '/^rtl8366ub-y += rtl8366ub_dsa.o/a rtl8366ub-y += l2.o' "$RTLPKG/src/Makefile"
+	mapfile -t PR_COMMITS < <(git rev-list --reverse "${BASE}..glinet/mt5000")
+	if [ "${#PR_COMMITS[@]}" -eq 0 ]; then
+		echo ">> ERROR: no commits found in ${BASE}..glinet/mt5000"
+		exit 1
+	fi
+	echo ">> Applying ${#PR_COMMITS[@]} commit(s) from PR #24237 (base ${BASE:0:12})"
 
-# Drop the swconfig package dependency (DSA core + tagger are in-kernel)
-sed -i 's#DEPENDS:=@TARGET_mediatek +kmod-swconfig#DEPENDS:=@TARGET_mediatek#' "$RTLPKG/Makefile"
+	for sha in "${PR_COMMITS[@]}"; do
+		subj=$(git log -1 --format='%h %s' "$sha")
+		echo "   -> $subj"
+		if ! git cherry-pick -n "$sha"; then
+			# Upstream main frequently adds new boards adjacent to glinet,gl-mt5000
+			# in board.d/02_network's ("lan1 lan2" eth1) case arm. Auto-resolve ONLY
+			# that trivial additive conflict; fail loudly on any other conflict.
+			mapfile -t UNMERGED < <(git diff --name-only --diff-filter=U)
+			if [ "${#UNMERGED[@]}" -eq 1 ] && [ "${UNMERGED[0]}" = "$BOARDD" ]; then
+				echo "   -> resolving additive board.d/02_network case-arm conflict"
+				git checkout --ours "$BOARDD"
+				if ! grep -q 'glinet,gl-mt5000' "$BOARDD"; then
+					perl -0pi -e 's/^(\ttplink,tl-xdr6086\|\\)$/\tglinet,gl-mt5000|\\\n$1/m' "$BOARDD"
+				fi
+				git add "$BOARDD"
+				rm -f .git/CHERRY_PICK_HEAD .git/MERGE_MSG
+			else
+				echo ">> ERROR: cherry-pick conflict on $subj:"
+				git status -s
+				git cherry-pick --abort 2>/dev/null || true
+				exit 1
+			fi
+		fi
+	done
+	echo ">> graft OK"
+fi
 
-# Scrub swconfig leftovers ONLY from the gl-mt5000 recipe (do NOT touch other
-# devices' recipes that legitimately use swconfig, e.g. mercusys_mr85x)
-sed -i '/^define Device\/glinet_gl-mt5000$/,/^endef$/{s/ kmod-rtl8366ub-mdio//g; s/ swconfig\b//g}' "$FILOGIC_MK"
+# --- 2. Sanity gates (each can actually fail) ------------------------------
+test -f "$DTS" || { echo ">> ERROR: DTS missing ($DTS)"; exit 1; }
+grep -q "realtek,rtl8366ub" "$DTS" || { echo ">> ERROR: rtl8366ub switch node missing from DTS"; exit 1; }
+grep -q "glinet_gl-mt5000" "$FILOGIC_MK" || { echo ">> ERROR: device recipe missing from $FILOGIC_MK"; exit 1; }
+grep -q "^CONFIG_NET_DSA_REALTEK_RTL8366UB=y" "$KCFG" || { echo ">> ERROR: CONFIG_NET_DSA_REALTEK_RTL8366UB=y missing from $KCFG"; exit 1; }
+grep -q "glinet,gl-mt5000" "$BOARDD" || { echo ">> ERROR: glinet,gl-mt5000 missing from $BOARDD"; exit 1; }
+sh -n "$BOARDD" || { echo ">> ERROR: $BOARDD has a shell syntax error"; exit 1; }
+test "$(grep -c 'glinet,gl-mt5000' "$PLATSH")" -ge 2 || { echo ">> ERROR: glinet,gl-mt5000 missing from platform_do_upgrade or platform_copy_config in $PLATSH"; exit 1; }
+sh -n "$PLATSH" || { echo ">> ERROR: $PLATSH has a shell syntax error"; exit 1; }
 
-# DSA device tree (switch as an mdio child, per-port user netdevs + cpu@17)
-cp "$WORKSPACE/files/dsa/mt7987a-gl-mt5000.dts" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts
-
-# GL's grafted board.d hunk inserts the gl-mt5000 case WITHOUT terminating the
-# preceding case (missing ';;') = shell syntax error. Repair the terminator AND
-# set the DSA default network (lan1/lan2 user ports, WAN on the SoC PHY eth1).
-perl -0pi -e 's/(ucidef_set_interfaces_lan_wan eth0 eth1\n)\s*glinet,gl-mt5000\)\s*\n.*?;;/$1\t\t;;\n\tglinet,gl-mt5000)\n\t\tucidef_set_interfaces_lan_wan "lan1 lan2" "eth1"\n\t\t;;/s' "$BOARDD"
-
-# Enable the RTL8_4 DSA tagger in the kernel config
-grep -q "CONFIG_NET_DSA_TAG_RTL8_4=y" "$KCFG" || echo "CONFIG_NET_DSA_TAG_RTL8_4=y" >> "$KCFG"
-
-# --- 3. Sanity gates (each can actually fail) ------------------------------
-grep -q "rtl8366ub_dsa.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: DSA object not wired into src/Makefile"; exit 1; }
-  grep -q "^rtl8366ub-y += l2.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: l2.o not wired (F7 fdb/learning/fast-age need rtksw_l2_*)"; exit 1; }
-grep -q "switch@0" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts || { echo ">> ERROR: DSA DTS not applied"; exit 1; }
-grep -qF 'ucidef_set_interfaces_lan_wan "lan1 lan2" "eth1"' "$BOARDD" || { echo ">> ERROR: gl-mt5000 DSA board.d line not injected"; exit 1; }
-grep -q 'glinet,gl-mt5000)' "$BOARDD" || { echo ">> ERROR: gl-mt5000 case missing from board.d"; exit 1; }
-if grep -q '17@eth0' "$BOARDD"; then echo ">> ERROR: stale swconfig ucidef_add_switch survived"; exit 1; fi
-sh -n "$BOARDD" || { echo ">> ERROR: board.d/02_network has a shell syntax error"; exit 1; }
-if grep -q 'kmod-rtl8366ub-mdio' "$FILOGIC_MK"; then echo ">> ERROR: nonexistent kmod-rtl8366ub-mdio still in DEVICE_PACKAGES"; exit 1; fi
-
-# --- 4. First-boot defaults ------------------------------------------------
+# --- 3. First-boot defaults ------------------------------------------------
 mkdir -p files/etc/uci-defaults
 cat > files/etc/uci-defaults/99-gl-mt5000 <<'UCI'
 #!/bin/sh
@@ -73,6 +87,4 @@ EOF
 exit 0
 UCI
 
-echo ">> DSA conversion applied"
-
-
+echo ">> diy.sh complete (OpenWrt main, kernel ${KVER})"

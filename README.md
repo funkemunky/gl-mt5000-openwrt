@@ -1,23 +1,32 @@
 # gl-mt5000-openwrt
 
-A **clean, minimal** build of **official OpenWrt 25.12** (kernel 6.12) for the
-**GL.iNet GL-MT5000 (Brume 3)** — with the RTL8371C ("RTL8366UB") switch driven
-as a proper **DSA** switch instead of the legacy swconfig driver.
+A **clean, minimal** build of **official OpenWrt `main`** (Linux **kernel 6.18**)
+for the **GL.iNet GL-MT5000 (Brume 3)** — with the RTL8371C ("RTL8366UB") switch
+driven by the in-tree **DSA** driver and **MediaTek PPE hardware flow offload**.
 
-This is *vanilla OpenWrt + the not-yet-merged device support + a ported DSA
-switch driver*. It is **not** a GL.iNet firmware fork, and it carries no proxy
-stack, themes, or external feeds.
+This is *vanilla upstream OpenWrt `main` + the not-yet-merged device-support PR*.
+It is **not** a GL.iNet firmware fork, and it carries no proxy stack, themes, or
+external feeds.
 
 ## What the build does
 
-1. Clones official `openwrt/openwrt` at branch `openwrt-25.12` (kernel 6.12).
-2. Grafts the GL-MT5000 device-support commit from OpenWrt PR
-   [#24237](https://github.com/openwrt/openwrt/pull/24237) (DTS, image recipe,
-   board files, and GL's GPL-released RTL8371C SDK package).
-3. Converts the switch package from GL's **swconfig** driver to a **DSA** driver
-   (`files/dsa/rtl8366ub_dsa.c`, ported from GL's kernel-5.4 code to the 6.12 DSA
-   API) and installs a matching DSA device tree (`files/dsa/mt7987a-gl-mt5000.dts`).
-4. Builds a minimal image: LuCI + `ethtool`/`ip-full`/`tcpdump` for validation.
+1. Clones official `openwrt/openwrt` at branch `main` (latest upstream OpenWrt
+   SNAPSHOT, currently Linux kernel **6.18**).
+2. Grafts the full GL-MT5000 commit series from OpenWrt PR
+   [#24237](https://github.com/openwrt/openwrt/pull/24237) (automatically skipped
+   once merged upstream):
+   - In-tree kernel 6.18 Realtek RTL8366UB MDIO DSA switch driver
+     (`CONFIG_NET_DSA_REALTEK_RTL8366UB=y`) and dedicated 802.1Q DSA tagger
+     (`CONFIG_NET_DSA_TAG_RTL8366UB_8021Q=y`) — no out-of-tree SDK package.
+   - MediaTek `mtk_eth_soc` fix restricting native MTK special-tag bits to MTK
+     DSA switches.
+   - MediaTek PPE hardware flow-offload support for the RTL8366UB 802.1Q DSA
+     tagger (standalone ports, VLAN-unaware bridges, and VLAN-filtering bridges).
+   - GL-MT5000 DTS (`mt7987a-glinet-gl-mt5000.dts`), image recipe
+     (`sysupgrade.bin` + `factory.bin`), `board.d/02_network` (`lan1 lan2` /
+     `eth1`), and eMMC `platform.sh` upgrade + `platform_copy_config` support.
+3. Builds a minimal image: LuCI + `kmod-nft-offload` +
+   `ethtool`/`ip-full`/`tcpdump`/`iperf3` for validation.
 
 All of that is driven by `scripts/diy.sh` and `config/mt5000.config`.
 
@@ -26,9 +35,10 @@ All of that is driven by `scripts/diy.sh` and `config/mt5000.config`.
 GitHub → **Actions** → **Build GL-MT5000 OpenWrt (DSA)** → **Run workflow**.
 When it finishes, download the **`gl-mt5000-firmware`** artifact (kept 14 days).
 It contains:
-- `openwrt-mediatek-filogic-glinet_gl-mt5000-squashfs-sysupgrade.bin` — flash image
+- `openwrt-mediatek-filogic-glinet_gl-mt5000-squashfs-sysupgrade.bin` — flash/upgrade image
+- `openwrt-mediatek-filogic-glinet_gl-mt5000-squashfs-factory.bin` — factory image
 - `...-initramfs-kernel.bin` — RAM-boot kernel for safe serial/U-Boot testing
-- `resolved.config`, `.manifest` — what was actually built
+- `resolved.config`, `.manifest`, `config.buildinfo` — what was actually built
 
 ## Install / recovery
 
@@ -40,27 +50,17 @@ It contains:
 
 ## Status / caveats
 
-- ⚠️ **The DSA driver is not yet hardware-validated.** It compiles, but LAN↔LAN,
-  the tagged VLAN trunk, and 2.5G link speed must be verified on a bench unit
-  before flashing a production router.
-- This driver is a **fork-only** solution. Mainline OpenWrt wants the RTL8371C
-  added to the existing `rtl8365mb` driver instead of vendoring GL's SDK
-  (see the discussion on PR #24237). This repo prioritizes a *working image now*.
-- MediaTek's PPE hardware flow-offload only supports MediaTek's own DSA tag
-  (`DSA_TAG_PROTO_MTK`); it rejects the Realtek `rtl8_4` tag
-  (`mtk_ppe_offload.c`: `if (proto != DSA_TAG_PROTO_MTK) return -ENODEV`).
-  So **routed LAN↔WAN flows run on the CPU** with software flow-offload rather
-  than the PPE — a hardware limitation of the Realtek-switch + MediaTek-SoC
-  pairing, not fixable in software. Actual NAT throughput is unmeasured.
-  LAN↔LAN switching stays in the switch hardware and is unaffected.
+- OpenWrt PR [#24237](https://github.com/openwrt/openwrt/pull/24237) is still
+  open upstream; once merged into `openwrt/openwrt` `main`, `scripts/diy.sh`
+  will automatically detect the upstream recipe and skip grafting.
+- Because this tracks `openwrt/openwrt` `main` (SNAPSHOT), upstream kernel
+  6.18 patch refreshes or `filogic` changes can occasionally cause drift until
+  PR #24237 is rebased or merged.
 
 ## Layout
 
 ```
-.github/workflows/build.yml   cloud build (GitHub Actions)
-scripts/diy.sh                graft + swconfig->DSA conversion
+.github/workflows/build.yml   cloud build (GitHub Actions, OpenWrt main / kernel 6.18)
+scripts/diy.sh                graft PR #24237 + sanity gates + first-boot defaults
 config/mt5000.config          lean seed .config
-files/dsa/rtl8366ub_dsa.c     DSA driver (ported 5.4 -> 6.12)
-files/dsa/mt7987a-gl-mt5000.dts  DSA device tree
 ```
-
