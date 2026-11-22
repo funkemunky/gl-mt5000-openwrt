@@ -32,7 +32,7 @@ All of that is driven by `scripts/diy.sh` and `config/mt5000.config`.
 
 ## Build it
 
-GitHub → **Actions** → **Build GL-MT5000 OpenWrt (DSA)** → **Run workflow**.
+GitHub or Gitea → **Actions** → **Build GL-MT5000 OpenWrt (DSA)** → **Run workflow**.
 When it finishes, download the **`gl-mt5000-firmware`** artifact (kept 14 days).
 It contains:
 - `openwrt-mediatek-filogic-glinet_gl-mt5000-squashfs-sysupgrade.bin` — flash/upgrade image
@@ -61,6 +61,7 @@ It contains:
 
 ```
 .github/workflows/build.yml   cloud build (GitHub Actions, OpenWrt main / kernel 6.18)
+.gitea/workflows/build.yml    Gitea Actions build (act_runner, OpenWrt main / kernel 6.18)
 scripts/diy.sh                graft PR #24237 + sanity gates + first-boot defaults
 config/mt5000.config          lean seed .config
 ```

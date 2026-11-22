@@ -1,0 +1,126 @@
+name: Build GL-MT5000 OpenWrt (DSA)
+
+on:
+  workflow_dispatch:
+
+env:
+  REPO_URL: https://github.com/openwrt/openwrt
+  REPO_BRANCH: main
+  GL_DEVICE_COMMIT: https://github.com/GLiNet-Tech/openwrt.git
+  OPENWRT_PATH: openwrt
+  TZ: Europe/Lisbon
+  DEBIAN_FRONTEND: noninteractive
+  # Gitea act_runner containers commonly execute as root; OpenWrt host tool
+  # configure scripts require this when UID == 0.
+  FORCE_UNSAFE_CONFIGURE: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+
+      - name: Check disk space
+        run: df -h .
+
+      - name: Install build dependencies
+        run: |
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          else
+            SUDO="sudo"
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools rsync swig unzip zlib1g-dev file wget \
+            libelf-dev ccache qemu-utils zstd perl ca-certificates
+
+      - name: Clone OpenWrt (official, main)
+        run: |
+          rm -rf "$OPENWRT_PATH"
+          # Blobless clone preserves full commit graph for exact git merge-base
+          # against PR #24237 without transferring historical file blobs.
+          git clone --filter=blob:none -b "$REPO_BRANCH" "$REPO_URL" "$OPENWRT_PATH"
+          cd "$OPENWRT_PATH"
+          KVER=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile)
+          KMINOR=$(sed -n "s/^LINUX_VERSION-${KVER} = //p" "target/linux/generic/kernel-${KVER}" 2>/dev/null || true)
+          echo "HEAD: $(git rev-parse --short HEAD) on $REPO_BRANCH (kernel ${KVER}${KMINOR})"
+
+      - name: Cache downloads & ccache
+        # Optional: act_runner's built-in cache server is disabled by default.
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/.ccache
+          key: mt5000-main-${{ hashFiles('config/mt5000.config', 'scripts/diy.sh') }}
+          restore-keys: mt5000-main-
+
+      - name: Graft GL-MT5000 + in-tree RTL8366UB DSA & PPE support (PR #24237)
+        run: |
+          REPO_ROOT="$PWD"
+          cd "$OPENWRT_PATH"
+          bash "$REPO_ROOT/scripts/diy.sh"
+
+      - name: Update & install feeds (official only)
+        run: |
+          cd "$OPENWRT_PATH"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure
+        run: |
+          REPO_ROOT="$PWD"
+          cd "$OPENWRT_PATH"
+          cp "$REPO_ROOT/config/mt5000.config" .config
+          make defconfig
+
+      - name: Verify GL-MT5000 target, DSA driver, and flow offload are selected
+        run: |
+          cd "$OPENWRT_PATH"
+          KVER=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile)
+          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-mt5000=y' .config \
+            || { echo "ERROR: glinet_gl-mt5000 target was dropped by defconfig"; exit 1; }
+          grep -q '^CONFIG_NET_DSA_REALTEK_RTL8366UB=y' "target/linux/mediatek/filogic/config-${KVER}" \
+            || { echo "ERROR: CONFIG_NET_DSA_REALTEK_RTL8366UB not enabled in config-${KVER}"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_kmod-nft-offload=y' .config \
+            || { echo "ERROR: kmod-nft-offload was dropped by defconfig"; exit 1; }
+          echo "glinet_gl-mt5000 + in-tree RTL8366UB DSA (kernel ${KVER}) + nft-offload: selected"
+
+      - name: Download sources
+        run: |
+          cd "$OPENWRT_PATH"
+          make -j$(nproc) download || make -j1 download
+
+      - name: Compile firmware
+        run: |
+          cd "$OPENWRT_PATH"
+          make -j$(nproc) || make -j$(nproc) || make -j1 V=s
+
+      - name: Collect firmware
+        if: always()
+        run: |
+          REPO_ROOT="$PWD"
+          mkdir -p "$REPO_ROOT/artifact"
+          if [ -d "$OPENWRT_PATH" ]; then
+            cd "$OPENWRT_PATH"
+            find bin/targets -type f \( -name '*sysupgrade.bin' -o -name '*factory.bin' \
+              -o -name '*initramfs*.bin' -o -name '*.manifest' -o -name 'config.buildinfo' \) \
+              -exec cp {} "$REPO_ROOT/artifact/" \; || true
+            cp .config "$REPO_ROOT/artifact/resolved.config" || true
+          fi
+          ls -la "$REPO_ROOT/artifact/" || true
+
+      - name: Upload firmware artifact
+        if: always()
+        # Use v3 for broad Gitea Actions / act_runner artifact API compatibility
+        # (official upload-artifact@v4 rejects non-GitHub.com/GHES endpoints).
+        uses: actions/upload-artifact@v3
+        with:
+          name: gl-mt5000-firmware
+          path: artifact/
+          if-no-files-found: warn
+          retention-days: 14
